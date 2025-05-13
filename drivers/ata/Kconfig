@@ -187,6 +187,7 @@ config AHCI_DWC
 
 config AHCI_EIC7700
 	tristate "Eswin AHCI SATA support"
+	depends on ARCH_ESWIN || COMPILE_TEST
 	select SATA_HOST
 	help
 	  This enables the AHCI SATA controller driver for Eswin SoCs. This driver
