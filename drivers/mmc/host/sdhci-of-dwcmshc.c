@@ -23,6 +23,10 @@
 
 #include "sdhci-pltfm.h"
 #include "cqhci.h"
+#include <linux/clk-provider.h>
+#include <linux/regmap.h>
+#include <linux/mfd/syscon.h>
+#include <linux/units.h>
 
 #define SDHCI_DWCMSHC_ARG2_STUFF	GENMASK(31, 16)
 
@@ -193,6 +197,10 @@
 #define PHY_DLLDL_CNFG_SLV_INPSEL_MASK	GENMASK(6, 5) /* bits [6:5] */
 #define PHY_DLLDL_CNFG_SLV_INPSEL	0x3 /* clock source select for slave DL */
 
+#define PHY_DLL_OFFST_R			(DWC_MSHC_PTR_PHY_R + 0x29)
+#define PHY_DLLBT_CNFG_R		(DWC_MSHC_PTR_PHY_R + 0x2c)
+#define PHY_DLL_STATUS_R		(DWC_MSHC_PTR_PHY_R + 0x2e)
+
 #define FLAG_IO_FIXED_1V8	BIT(0)
 
 #define BOUNDARY_OK(addr, len) \
@@ -205,6 +213,49 @@
 /* SMC call for BlueField-3 eMMC RST_N */
 #define BLUEFIELD_SMC_SET_EMMC_RST_N	0x82000007
 
+/* Eswin specific Registers */
+#define MSHC_CARD_CLK_STABLE				BIT(28)
+#define MSHC_INT_BCLK_STABLE				BIT(16)
+#define MSHC_INT_ACLK_STABLE				BIT(8)
+#define MSHC_INT_TMCLK_STABLE				BIT(0)
+#define MSHC_INT_CLK_STABLE		(MSHC_CARD_CLK_STABLE | \
+								 MSHC_INT_ACLK_STABLE | \
+								 MSHC_INT_BCLK_STABLE | \
+								 MSHC_INT_TMCLK_STABLE)
+#define MSHC_HOST_VAL_STABLE				BIT(0)
+
+#define MSHC_CORE_CLK_ENABLE				BIT(16)
+#define MSHC_CORE_CLK_FREQ_BIT_SHIFT		4
+#define MSHC_CORE_CLK_FREQ_BIT_MASK			0xfffu
+#define MSHC_CORE_CLK_SEL_BIT				BIT(0)
+
+/* strength definition */
+#define PHYCTRL_DR_33OHM					0xee
+#define PHYCTRL_DR_40OHM					0xcc
+#define PHYCTRL_DR_50OHM					0x88
+#define PHYCTRL_DR_66OHM					0x44
+#define PHYCTRL_DR_100OHM					0x00
+
+#define LATENCY_LT_BIT_OFFSET				19
+#define LATENCY_LT_MASK						0x3
+#define LATENCY_LT_3						0x2
+#define VENDOR_AT_SATA_R					0x544
+
+#define MAX_PHASE_CODE						0xff
+#define TUNING_RANGE_THRESHOLD				40
+
+#define PHY_CLK_MAX_DELAY_MASK				0x7f
+#define PHY_PAD_SP_DRIVE_SHIF				16
+
+#define SDHCI_ESWIN_CORE_CLK_SRC_208MHZ		(208 * HZ_PER_MHZ)
+#define SDHCI_ESWIN_CORE_CLK_SRC_200MHZ		(200 * HZ_PER_MHZ)
+#define MAX_CORE_CLK_DIV					0xfff
+#define DLL_LOCK_STS						BIT(0)
+#define DLL_ERROR_STS						BIT(1)
+#define PHY_DELAY_CODE_MAX					0x7f
+#define PHY_DELAY_CODE_EMMC					0x17
+#define PHY_DELAY_CODE_SD					0x55
+
 enum dwcmshc_rk_type {
 	DWCMSHC_RK3568,
 	DWCMSHC_RK3588,
@@ -214,6 +265,21 @@ struct rk35xx_priv {
 	struct reset_control *reset;
 	enum dwcmshc_rk_type devtype;
 	u8 txclk_tapnum;
+};
+struct eswin_priv {
+	struct sdhci_host *host;
+	struct clk_hw sdcardclk_hw;
+	struct clk *sdcardclk;
+	int clk_phase_in[MMC_TIMING_MMC_HS400 + 1];
+	int clk_phase_out[MMC_TIMING_MMC_HS400 + 1];
+	void (*set_clk_delays)(struct sdhci_host *host);
+	struct reset_control *reset;
+	struct regmap *crg_regmap;
+	unsigned int crg_core_clk;
+	struct regmap *hsp_regmap;
+	unsigned int hsp_int_status;
+	unsigned int hsp_pwr_ctrl;
+	unsigned int drive_impedance;
 };
 
 #define DWCMSHC_MAX_OTHER_CLKS 3
@@ -236,6 +302,8 @@ struct dwcmshc_pltfm_data {
 	int (*init)(struct device *dev, struct sdhci_host *host, struct dwcmshc_priv *dwc_priv);
 	void (*postinit)(struct sdhci_host *host, struct dwcmshc_priv *dwc_priv);
 };
+
+static void dwcmshc_disable_card_clk(struct sdhci_host *host);
 
 static int dwcmshc_get_enable_other_clks(struct device *dev,
 					 struct dwcmshc_priv *priv,
@@ -1071,6 +1139,692 @@ static int sg2042_init(struct device *dev, struct sdhci_host *host,
 					     ARRAY_SIZE(clk_ids), clk_ids);
 }
 
+static void sdhci_eswin_enable_card_clk(struct sdhci_host *host)
+{
+	ktime_t timeout;
+	unsigned int clk;
+
+	clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
+
+	clk |= SDHCI_CLOCK_INT_EN;
+	sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+
+	/* Wait max 150 ms */
+	timeout = ktime_add_ms(ktime_get(), 150);
+	while (1) {
+		bool timedout = ktime_after(ktime_get(), timeout);
+
+		clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
+		if (clk & SDHCI_CLOCK_INT_STABLE)
+			break;
+		if (timedout) {
+			pr_err("%s: Internal clock never stabilised.\n",
+				 mmc_hostname(host->mmc));
+			return;
+		}
+		usleep_range(10, 20);
+	}
+
+	clk |= SDHCI_CLOCK_CARD_EN;
+	sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+	usleep_range(1000, 2000);
+}
+
+static void eswin_mshc_coreclk_disable(struct sdhci_host *host)
+{
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *dwc_priv = sdhci_pltfm_priv(pltfm_host);
+	struct eswin_priv *priv = dwc_priv->priv;
+	u32 val = 0;
+
+	regmap_read(priv->crg_regmap, priv->crg_core_clk, &val);
+	val &= ~MSHC_CORE_CLK_ENABLE;
+	regmap_write(priv->crg_regmap, priv->crg_core_clk, val);
+}
+
+static void eswin_mshc_coreclk_config(struct sdhci_host *host, uint16_t divisor,
+					 unsigned int flag_sel)
+{
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *dwc_priv = sdhci_pltfm_priv(pltfm_host);
+	struct eswin_priv *priv = dwc_priv->priv;
+	u32 val = 0;
+
+	regmap_read(priv->crg_regmap, priv->crg_core_clk, &val);
+	val &= ~MSHC_CORE_CLK_ENABLE;
+	regmap_write(priv->crg_regmap, priv->crg_core_clk, val);
+	usleep_range(10, 20);
+
+	val &= ~(MSHC_CORE_CLK_FREQ_BIT_MASK << MSHC_CORE_CLK_FREQ_BIT_SHIFT);
+	val |= (divisor & MSHC_CORE_CLK_FREQ_BIT_MASK)
+			 << MSHC_CORE_CLK_FREQ_BIT_SHIFT;
+	val &= ~(MSHC_CORE_CLK_SEL_BIT);
+	val |= flag_sel;
+	regmap_write(priv->crg_regmap, priv->crg_core_clk, val);
+
+	usleep_range(50, 60);
+	val |= MSHC_CORE_CLK_ENABLE;
+	regmap_write(priv->crg_regmap, priv->crg_core_clk, val);
+	usleep_range(1000, 1100);
+}
+
+static void sdhci_eswin_set_core_clock(struct sdhci_host *host, unsigned int clock)
+{
+	unsigned int div, divide;
+	unsigned int flag_sel, max_clk;
+
+	host->mmc->actual_clock = clock;
+
+	if (clock == 0) {
+		eswin_mshc_coreclk_disable(host);
+		return;
+	}
+
+	if (SDHCI_ESWIN_CORE_CLK_SRC_208MHZ % clock == 0) {
+		flag_sel = 1;
+		max_clk = SDHCI_ESWIN_CORE_CLK_SRC_208MHZ;
+	} else {
+		flag_sel = 0;
+		max_clk = SDHCI_ESWIN_CORE_CLK_SRC_200MHZ;
+	}
+
+	for (div = 1; div <= MAX_CORE_CLK_DIV; div++) {
+		if ((max_clk / div) <= clock)
+			break;
+	}
+	div--;
+
+	if (div == 0 || div == 1)
+		divide = 2;
+	else
+		divide = (div + 1) * 2;
+
+	dwcmshc_disable_card_clk(host);
+	eswin_mshc_coreclk_config(host, divide, flag_sel);
+	sdhci_eswin_enable_card_clk(host);
+	usleep_range(2000, 3000);
+}
+
+static void sdhci_eswin_set_clock(struct sdhci_host *host, unsigned int clock)
+{
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *dwc_priv = sdhci_pltfm_priv(pltfm_host);
+	struct eswin_priv *priv = dwc_priv->priv;
+
+	/* Set the Input and Output Clock Phase Delays */
+	if (priv->set_clk_delays)
+		priv->set_clk_delays(host);
+
+	sdhci_eswin_set_core_clock(host, clock);
+}
+
+static void sdhci_eswin_config_phy_delay(struct sdhci_host *host, int delay)
+{
+	delay &= PHY_CLK_MAX_DELAY_MASK;
+
+	/*phy clk delay line config*/
+	sdhci_writeb(host, PHY_SDCLKDL_CNFG_UPDATE, PHY_SDCLKDL_CNFG_R);
+	sdhci_writeb(host, delay, PHY_SDCLKDL_DC_R);
+	sdhci_writeb(host, 0x0, PHY_SDCLKDL_CNFG_R);
+}
+
+static void sdhci_eswin_config_phy(struct sdhci_host *host)
+{
+	unsigned int val = 0;
+	unsigned int drv = 0;
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *dwc_priv = sdhci_pltfm_priv(pltfm_host);
+	struct eswin_priv *priv = dwc_priv->priv;
+	u32 emmc_caps = MMC_CAP2_NO_SD | MMC_CAP2_NO_SDIO;
+
+	drv = priv->drive_impedance << PHY_PAD_SP_DRIVE_SHIF;
+
+	if ((host->mmc->caps2 & emmc_caps) == emmc_caps) {
+		val = sdhci_readw(host, dwc_priv->vendor_specific_area1 + DWCMSHC_EMMC_CONTROL);
+		val |= DWCMSHC_CARD_IS_EMMC;
+		sdhci_writew(host, val, dwc_priv->vendor_specific_area1 + DWCMSHC_EMMC_CONTROL);
+	}
+
+	dwcmshc_disable_card_clk(host);
+
+	/* reset phy, config phy's pad */
+	sdhci_writel(host, drv | (~PHY_CNFG_RSTN_DEASSERT), PHY_CNFG_R);
+
+	/* configure phy pads */
+	val = FIELD_PREP(PHY_PAD_TXSLEW_CTRL_P_MASK, PHY_PAD_TXSLEW_CTRL_N_SG2042);
+	val |= FIELD_PREP(PHY_PAD_TXSLEW_CTRL_N_MASK, PHY_PAD_TXSLEW_CTRL_N_SG2042);
+	val |= FIELD_PREP(PHY_PAD_WEAKPULL_MASK, PHY_PAD_WEAKPULL_PULLUP);
+	val |= PHY_PAD_RXSEL_1V8;
+	sdhci_writew(host, val, PHY_CMDPAD_CNFG_R);
+	sdhci_writew(host, val, PHY_DATAPAD_CNFG_R);
+	sdhci_writew(host, val, PHY_RSTNPAD_CNFG_R);
+
+	/* Clock PAD Setting */
+	val = FIELD_PREP(PHY_PAD_TXSLEW_CTRL_P_MASK, PHY_PAD_TXSLEW_CTRL_N_SG2042);
+	val |= FIELD_PREP(PHY_PAD_TXSLEW_CTRL_N_MASK, PHY_PAD_TXSLEW_CTRL_N_SG2042);
+	sdhci_writew(host, val, PHY_CLKPAD_CNFG_R);
+
+	/* PHY strobe PAD setting (EMMC only) */
+	if ((host->mmc->caps2 & emmc_caps) == emmc_caps) {
+		val = FIELD_PREP(PHY_PAD_TXSLEW_CTRL_P_MASK, PHY_PAD_TXSLEW_CTRL_N_SG2042);
+		val |= FIELD_PREP(PHY_PAD_TXSLEW_CTRL_N_MASK, PHY_PAD_TXSLEW_CTRL_N_SG2042);
+		val |= PHY_PAD_RXSEL_1V8;
+		sdhci_writew(host, val, PHY_STBPAD_CNFG_R);
+	}
+	usleep_range(2000, 3000);
+	sdhci_writel(host, drv | PHY_CNFG_RSTN_DEASSERT, PHY_CNFG_R);
+	sdhci_eswin_config_phy_delay(host, dwc_priv->delay_line);
+	sdhci_eswin_enable_card_clk(host);
+}
+
+static void sdhci_eswin_reset(struct sdhci_host *host, u8 mask)
+{
+	sdhci_reset(host, mask);
+
+	/* after reset all, the phy's config will be clear */
+	if (mask == SDHCI_RESET_ALL)
+		sdhci_eswin_config_phy(host);
+}
+
+static unsigned long sdhci_eswin_sdcardclk_recalc_rate(struct clk_hw *hw,
+							 unsigned long parent_rate)
+{
+	struct eswin_priv *priv  =
+		container_of(hw, struct eswin_priv, sdcardclk_hw);
+
+	return priv->host->mmc->actual_clock;
+}
+
+static const struct clk_ops eswin_sdcardclk_ops = {
+	.recalc_rate = sdhci_eswin_sdcardclk_recalc_rate,
+};
+
+static int sdhci_eswin_register_sdcardclk(struct eswin_priv *priv,
+					 struct clk *clk, struct device *dev)
+{
+	struct device_node *np = dev->of_node;
+	struct clk_init_data sdcardclk_init;
+	const char *parent_clk_name;
+	int ret;
+
+	ret = of_property_read_string_index(np, "clock-output-names", 0,
+					 &sdcardclk_init.name);
+	if (ret) {
+		dev_err(dev, "DT has #clock-cells but no clock-output-names\n");
+		return ret;
+	}
+
+	parent_clk_name = __clk_get_name(clk);
+	sdcardclk_init.parent_names = &parent_clk_name;
+	sdcardclk_init.num_parents = 1;
+	sdcardclk_init.flags = CLK_GET_RATE_NOCACHE;
+	sdcardclk_init.ops = &eswin_sdcardclk_ops;
+
+	priv->sdcardclk_hw.init = &sdcardclk_init;
+	priv->sdcardclk = devm_clk_register(dev, &priv->sdcardclk_hw);
+	if (IS_ERR(priv->sdcardclk))
+		return PTR_ERR(priv->sdcardclk);
+	priv->sdcardclk_hw.init = NULL;
+
+	ret = of_clk_add_provider(np, of_clk_src_simple_get,
+				 priv->sdcardclk);
+	if (ret)
+		dev_err(dev, "Failed to add sdcard clock provider\n");
+
+	return ret;
+}
+
+static int sdhci_eswin_register_sdclk(struct dwcmshc_priv *dwc_priv,
+					 struct clk *clk, struct device *dev)
+{
+	struct device_node *np = dev->of_node;
+	u32 num_clks = 0;
+	int ret;
+
+	/* Providing a clock to the PHY is optional; no error if missing */
+	if (of_property_read_u32(np, "#clock-cells", &num_clks) < 0)
+		return 0;
+	ret = sdhci_eswin_register_sdcardclk(dwc_priv->priv, clk, dev);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int sdhci_eswin_reset_init(struct device *dev,
+				 struct eswin_priv *priv)
+{
+	int ret = 0;
+
+	priv->reset = devm_reset_control_array_get_optional_exclusive(dev);
+	if (IS_ERR(priv->reset)) {
+		ret = PTR_ERR(priv->reset);
+		dev_err(dev, "failed to get reset control %d\n", ret);
+		return ret;
+	}
+
+	ret = reset_control_assert(priv->reset);
+	if (ret) {
+		pr_err("Failed to assert reset signals: %d\n", ret);
+		return ret;
+	}
+	usleep_range(2000, 2100);
+	ret = reset_control_deassert(priv->reset);
+	if (ret) {
+		pr_err("Failed to deassert reset signals: %d\n", ret);
+		return ret;
+	}
+
+	return ret;
+}
+
+static void sdhci_eswin_set_clk_delays(struct sdhci_host *host)
+{
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *dwc_priv = sdhci_pltfm_priv(pltfm_host);
+	struct eswin_priv *priv = dwc_priv->priv;
+
+	clk_set_phase(priv->sdcardclk,
+			 priv->clk_phase_out[host->timing]);
+}
+
+static void sdhci_eswin_dt_read_clk_phase(struct device *dev,
+					 struct eswin_priv *priv,
+					 unsigned int timing, const char *prop)
+{
+	struct device_node *np = dev->of_node;
+	int clk_phase[2] = {0};
+
+	/*
+	 * Read Tap Delay values from DT, if the DT does not contain the
+	 * Tap Values then use the pre-defined values.
+	 */
+	if (of_property_read_variable_u32_array(np, prop, &clk_phase[0], 2,
+						 0)) {
+		dev_dbg(dev, "Using predefined clock phase for %s = %d %d\n",
+			prop, priv->clk_phase_in[timing],
+			priv->clk_phase_out[timing]);
+		return;
+	}
+
+	/* The values read are Input and Output Clock Delays in order */
+	priv->clk_phase_in[timing] = clk_phase[0];
+	priv->clk_phase_out[timing] = clk_phase[1];
+}
+
+static void sdhci_eswin_dt_parse_clk_phases(struct device *dev,
+					 struct dwcmshc_priv *dwc_priv)
+{
+	struct eswin_priv *priv = dwc_priv->priv;
+
+	priv->set_clk_delays = sdhci_eswin_set_clk_delays;
+
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_LEGACY,
+					 "clk-phase-legacy");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_MMC_HS,
+					 "clk-phase-mmc-hs");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_SD_HS,
+					 "clk-phase-sd-hs");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_UHS_SDR12,
+					 "clk-phase-uhs-sdr12");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_UHS_SDR25,
+					 "clk-phase-uhs-sdr25");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_UHS_SDR50,
+					 "clk-phase-uhs-sdr50");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_UHS_SDR104,
+					 "clk-phase-uhs-sdr104");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_UHS_DDR50,
+					 "clk-phase-uhs-ddr50");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_MMC_DDR52,
+					 "clk-phase-mmc-ddr52");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_MMC_HS200,
+					 "clk-phase-mmc-hs200");
+	sdhci_eswin_dt_read_clk_phase(dev, priv, MMC_TIMING_MMC_HS400,
+					 "clk-phase-mmc-hs400");
+}
+
+static unsigned int eswin_convert_drive_impedance_ohm(struct device *dev,
+						 unsigned int dr_ohm)
+{
+	switch (dr_ohm) {
+	case 100:
+		return PHYCTRL_DR_100OHM;
+	case 66:
+		return PHYCTRL_DR_66OHM;
+	case 50:
+		return PHYCTRL_DR_50OHM;
+	case 40:
+		return PHYCTRL_DR_40OHM;
+	case 33:
+		return PHYCTRL_DR_33OHM;
+	}
+
+	dev_warn(dev, "Invalid value %u for drive-impedance-ohm.\n",
+		 dr_ohm);
+	return PHYCTRL_DR_50OHM;
+}
+
+static int sdhci_eswin_delay_tuning(struct sdhci_host *host, u32 opcode)
+{
+	int ret;
+	int delay = 0;
+	int i = 0;
+	int delay_min = -1;
+	int delay_max = -1;
+	int cmd_error = 0;
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *dwc_priv = sdhci_pltfm_priv(pltfm_host);
+
+	for (i = 0; i <= PHY_DELAY_CODE_MAX; i++) {
+		dwcmshc_disable_card_clk(host);
+		sdhci_eswin_config_phy_delay(host, i);
+		sdhci_eswin_enable_card_clk(host);
+		ret = mmc_send_tuning(host->mmc, opcode, &cmd_error);
+		if (ret) {
+			host->ops->reset(host,
+					 SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+			usleep_range(200, 210);
+			if (delay_min != -1 && delay_max != -1)
+				break;
+		} else {
+			if (delay_min == -1) {
+				delay_min = i;
+				continue;
+			} else {
+				delay_max = i;
+				continue;
+			}
+		}
+	}
+	if (delay_min == -1 && delay_max == -1) {
+		pr_err("%s: delay code tuning failed!\n",
+			 mmc_hostname(host->mmc));
+		dwcmshc_disable_card_clk(host);
+		sdhci_eswin_config_phy_delay(host, dwc_priv->delay_line);
+		sdhci_eswin_enable_card_clk(host);
+
+		return ret;
+	}
+
+	delay = (delay_min + delay_max) / 2;
+	dwcmshc_disable_card_clk(host);
+	sdhci_eswin_config_phy_delay(host, delay);
+	sdhci_eswin_enable_card_clk(host);
+
+	return 0;
+}
+
+static int sdhci_eswin_phase_code_tuning(struct sdhci_host *host, u32 opcode)
+{
+	int cmd_error = 0;
+	int ret = 0;
+	int phase_code = 0;
+	int code_min = -1;
+	int code_max = -1;
+	int code_range = -1;
+	int i = 0;
+	bool is_sdio = false;
+	u32 sd_caps = MMC_CAP2_NO_MMC | MMC_CAP2_NO_SDIO;
+
+	if ((host->mmc->caps2 & sd_caps) == sd_caps)
+		is_sdio = true;
+
+	for (i = 0; i <= MAX_PHASE_CODE; i++) {
+		dwcmshc_disable_card_clk(host);
+		sdhci_writew(host, i, VENDOR_AT_SATA_R);
+		sdhci_eswin_enable_card_clk(host);
+
+		ret = mmc_send_tuning(host->mmc, opcode, &cmd_error);
+
+		/* SDIO specific reset after each tuning attempt */
+		if (is_sdio)
+			host->ops->reset(host, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+
+		if (ret) {
+			if (!is_sdio)
+				host->ops->reset(host, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+			usleep_range(200, 210);
+
+			/* SDIO specific range tracking */
+			if (is_sdio && code_min != -1 && code_max != -1) {
+				if (code_max - code_min > code_range) {
+					code_range = code_max - code_min;
+					phase_code = (code_min + code_max) / 2;
+					if (code_range > TUNING_RANGE_THRESHOLD)
+						break;
+				}
+				code_min = -1;
+				code_max = -1;
+			}
+			/* EMMC breaks after first valid range */
+			if (!is_sdio && code_min != -1 && code_max != -1)
+				break;
+		} else {
+			/* Track valid phase code range */
+			if (code_min == -1) {
+				code_min = i;
+				if (!is_sdio)
+					continue;
+			}
+			code_max = i;
+			if (is_sdio && i == MAX_PHASE_CODE) {
+				if (code_max - code_min > code_range) {
+					code_range = code_max - code_min;
+					phase_code = (code_min + code_max) / 2;
+				}
+			}
+		}
+	}
+
+	/* Handle tuning failure case */
+	if ((is_sdio && phase_code == -1) || (!is_sdio && code_min == -1 && code_max == -1)) {
+		pr_err("%s: phase code tuning failed!\n", mmc_hostname(host->mmc));
+		dwcmshc_disable_card_clk(host);
+		sdhci_writew(host, 0, VENDOR_AT_SATA_R);
+		sdhci_eswin_enable_card_clk(host);
+		return -EIO;
+	}
+	if (!is_sdio)
+		phase_code = (code_min + code_max) / 2;
+
+	dwcmshc_disable_card_clk(host);
+	sdhci_writew(host, phase_code, VENDOR_AT_SATA_R);
+	sdhci_eswin_enable_card_clk(host);
+
+	/* SDIO specific final verification */
+	if (is_sdio) {
+		ret = mmc_send_tuning(host->mmc, opcode, &cmd_error);
+		host->ops->reset(host, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+		if (ret) {
+			pr_err("%s: Final phase code 0x%x verification failed!\n",
+				 mmc_hostname(host->mmc), phase_code);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int sdhci_eswin_executing_tuning(struct sdhci_host *host, u32 opcode)
+{
+	u32 ctrl;
+	u32 val;
+	int ret = 0;
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	u32 emmc_caps = MMC_CAP2_NO_SD | MMC_CAP2_NO_SDIO;
+
+	if ((host->mmc->caps2 & emmc_caps) != emmc_caps)
+		sdhci_pltfm_priv(pltfm_host);
+
+	dwcmshc_disable_card_clk(host);
+
+	ctrl = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+	ctrl &= ~SDHCI_CTRL_TUNED_CLK;
+	sdhci_writew(host, ctrl, SDHCI_HOST_CONTROL2);
+
+	val = sdhci_readl(host, priv->vendor_specific_area1 + DWCMSHC_EMMC_ATCTRL);
+	val |= AT_CTRL_SW_TUNE_EN;
+	sdhci_writew(host, val, priv->vendor_specific_area1 + DWCMSHC_EMMC_ATCTRL);
+
+	sdhci_writew(host, 0, VENDOR_AT_SATA_R);
+	sdhci_eswin_enable_card_clk(host);
+	sdhci_writew(host, 0x0, SDHCI_CMD_DATA);
+
+	if ((host->mmc->caps2 & emmc_caps) == emmc_caps) {
+		ret = sdhci_eswin_delay_tuning(host, opcode);
+		if (ret < 0)
+			return ret;
+	}
+
+	ret = sdhci_eswin_phase_code_tuning(host, opcode);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
+static void sdhci_eswin_set_uhs_signaling(struct sdhci_host *host,
+					 unsigned int timing)
+{
+	u32 val;
+	u32 status;
+	u32 timeout = 0;
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct dwcmshc_priv *priv = sdhci_pltfm_priv(pltfm_host);
+
+	dwcmshc_set_uhs_signaling(host, timing);
+
+	/*
+	 * here need make dll locked when in hs400 at 200MHz
+	 */
+	if ((timing == MMC_TIMING_MMC_HS400) && (host->clock == 200000000)) {
+		dwcmshc_disable_card_clk(host);
+
+		val = sdhci_readl(host, priv->vendor_specific_area1 + DWCMSHC_EMMC_ATCTRL);
+		val &= ~(LATENCY_LT_MASK << LATENCY_LT_BIT_OFFSET);
+		val |= (LATENCY_LT_3 << LATENCY_LT_MASK);
+		sdhci_writew(host, val, priv->vendor_specific_area1 + DWCMSHC_EMMC_ATCTRL);
+
+		sdhci_writeb(host, 0x23, PHY_DLL_CNFG1_R);
+		sdhci_writeb(host, 0x02, PHY_DLL_CNFG2_R);
+		sdhci_writeb(host, 0x60, PHY_DLLDL_CNFG_R);
+		sdhci_writeb(host, 0x00, PHY_DLL_OFFST_R);
+		sdhci_writew(host, 0xffff, PHY_DLLBT_CNFG_R);
+
+		sdhci_eswin_enable_card_clk(host);
+		sdhci_writeb(host, PHY_DLL_CTRL_ENABLE, PHY_DLL_CTRL_R);
+		usleep_range(100, 110);
+
+		while (1) {
+			status = sdhci_readb(host, PHY_DLL_STATUS_R);
+			if (status & DLL_LOCK_STS)
+				break;
+			timeout++;
+			usleep_range(100, 110);
+			if (timeout > 10000) {
+				pr_err("%s: DLL lock failed!status:0x%x\n",
+					 mmc_hostname(host->mmc), status);
+				return;
+			}
+		}
+
+		status = sdhci_readb(host, PHY_DLL_STATUS_R);
+		if (status & DLL_ERROR_STS) {
+			pr_err("%s: DLL lock failed!err_status:0x%x\n",
+				 mmc_hostname(host->mmc), status);
+		}
+	}
+}
+
+static void sdhci_eswin_set_uhs_wrapper(struct sdhci_host *host, unsigned int timing)
+{
+	u32 sd_caps = MMC_CAP2_NO_MMC | MMC_CAP2_NO_SDIO;
+
+	if ((host->mmc->caps2 & sd_caps) == sd_caps)
+		sdhci_set_uhs_signaling(host, timing);
+	else
+		sdhci_eswin_set_uhs_signaling(host, timing);
+}
+
+static int eswin_init(struct device *dev, struct sdhci_host *host,
+				 struct dwcmshc_priv *dwc_priv)
+{
+	int ret;
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct of_phandle_args args;
+	struct eswin_priv *priv;
+	unsigned int val = 0;
+	u32 emmc_caps = MMC_CAP2_NO_SD | MMC_CAP2_NO_SDIO;
+
+	priv = devm_kzalloc(dev, sizeof(struct eswin_priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	priv->host = host;
+	dwc_priv->priv = priv;
+
+	ret = sdhci_eswin_register_sdclk(dwc_priv, pltfm_host->clk, dev);
+	if (ret)
+		return ret;
+
+	ret = sdhci_eswin_reset_init(dev, dwc_priv->priv);
+	if (ret < 0) {
+		dev_err(dev, "failed to reset\n");
+		return ret;
+	}
+
+	ret = of_parse_phandle_with_fixed_args(dev->of_node,
+			 "eswin,syscrg-csr", 1, 0, &args);
+	if (ret) {
+		dev_err(dev,
+			 "Failed to parse 'eswin,syscrg-csr' phandle/args (%d)\n", ret);
+		return ret;
+	}
+	priv->crg_regmap = syscon_node_to_regmap(args.np);
+	if (IS_ERR(priv->crg_regmap)) {
+		dev_err(dev, "Failed to get regmap for 'eswin,syscrg-csr'\n");
+		of_node_put(args.np);
+		return ret;
+	}
+
+	priv->crg_core_clk = args.args[0];
+	of_node_put(args.np);
+
+	ret = of_parse_phandle_with_fixed_args(dev->of_node,
+			 "eswin,hsp-sp-csr", 2, 0, &args);
+	if (ret) {
+		dev_err(dev,
+			 "Failed to parse 'eswin,hsp-sp-csr' phandle/args (%d)\n", ret);
+		return ret;
+	}
+
+	priv->hsp_regmap = syscon_node_to_regmap(args.np);
+	if (IS_ERR(priv->hsp_regmap)) {
+		dev_err(dev, "Failed to get regmap for 'eswin,hsp-sp-csr'\n");
+		of_node_put(args.np);
+		return ret;
+	}
+	priv->hsp_int_status = args.args[0];
+	priv->hsp_pwr_ctrl = args.args[1];
+	of_node_put(args.np);
+	regmap_write(priv->hsp_regmap, priv->hsp_int_status,
+			 MSHC_INT_CLK_STABLE);
+	regmap_write(priv->hsp_regmap, priv->hsp_pwr_ctrl,
+			 MSHC_HOST_VAL_STABLE);
+
+	if ((host->mmc->caps2 & emmc_caps) == emmc_caps)
+		dwc_priv->delay_line = PHY_DELAY_CODE_EMMC;
+	else
+		dwc_priv->delay_line = PHY_DELAY_CODE_SD;
+
+	if (!of_property_read_u32(dev->of_node, "drive-impedance-ohm", &val))
+		priv->drive_impedance =
+			eswin_convert_drive_impedance_ohm(dev, val);
+
+	sdhci_eswin_dt_parse_clk_phases(dev, dwc_priv);
+	return 0;
+}
+
 static const struct sdhci_ops sdhci_dwcmshc_ops = {
 	.set_clock		= sdhci_set_clock,
 	.set_bus_width		= sdhci_set_bus_width,
@@ -1145,6 +1899,18 @@ static const struct sdhci_ops sdhci_dwcmshc_sg2042_ops = {
 	.platform_execute_tuning = th1520_execute_tuning,
 };
 
+static const struct sdhci_ops sdhci_dwcmshc_eswin_ops = {
+	.set_clock = sdhci_eswin_set_clock,
+	.get_max_clock = sdhci_pltfm_clk_get_max_clock,
+	.get_timeout_clock = sdhci_pltfm_clk_get_max_clock,
+	.set_bus_width = sdhci_set_bus_width,
+	.reset = sdhci_eswin_reset,
+	.set_uhs_signaling = sdhci_eswin_set_uhs_wrapper,
+	.set_power = sdhci_set_power_and_bus_voltage,
+	.irq = dwcmshc_cqe_irq_handler,
+	.platform_execute_tuning = sdhci_eswin_executing_tuning,
+};
+
 static const struct dwcmshc_pltfm_data sdhci_dwcmshc_pdata = {
 	.pdata = {
 		.ops = &sdhci_dwcmshc_ops,
@@ -1200,6 +1966,17 @@ static const struct dwcmshc_pltfm_data sdhci_dwcmshc_sg2042_pdata = {
 		.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN,
 	},
 	.init = sg2042_init,
+};
+
+static const struct dwcmshc_pltfm_data sdhci_dwcmshc_eswin_pdata = {
+	.pdata = {
+		.ops = &sdhci_dwcmshc_eswin_ops,
+		.quirks = SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN |
+				 SDHCI_QUIRK_BROKEN_TIMEOUT_VAL,
+		.quirks2 = SDHCI_QUIRK2_PRESET_VALUE_BROKEN |
+				 SDHCI_QUIRK2_CLOCK_DIV_ZERO_BROKEN,
+	},
+	.init = eswin_init,
 };
 
 static const struct cqhci_host_ops dwcmshc_cqhci_ops = {
@@ -1297,6 +2074,10 @@ static const struct of_device_id sdhci_dwcmshc_dt_ids[] = {
 	{
 		.compatible = "sophgo,sg2042-dwcmshc",
 		.data = &sdhci_dwcmshc_sg2042_pdata,
+	},
+	{
+		.compatible = "eswin,eic7700-dwcmshc",
+		.data = &sdhci_dwcmshc_eswin_pdata,
 	},
 	{},
 };
